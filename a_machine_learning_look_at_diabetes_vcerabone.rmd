@@ -1,0 +1,496 @@
+---
+title: "Project-ISYE7406"
+author: "Victor Cerabone"
+date: "2024-03-29"
+output: html_document
+---
+
+### Install packages and setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)### for manipulating data
+library(class)### for KNN
+library(ggplot2)###for plotting
+library(reshape2)## for melting
+library(knitr)
+library(kableExtra)##for nice printing of console
+library(caret)
+library(MASS)
+library(leaps)
+library(lars)
+library(pls)
+library(coop)
+library(corrplot,)
+library(e1071)#Naive Bayes
+library(nnet)
+library(factoextra)# for fviz_eig()
+library(foreign)
+library(tibble)
+library(tidyverse)
+library(gbm)
+library(cvms)#conf matrix
+library(tidyr)
+library(ROSE)#upsampling
+library(forcats)#sorting ggpplot
+```
+
+### Load data file and create response var
+```{r load}
+#https://www.cdc.gov/diabetes/basics/getting-tested.html#:~:text=A%20fasting%20blood%20sugar%20level,higher%20indicates%20you%20have%20diabetes.
+
+#https://wwwn.cdc.gov/nchs/nhanes/continuousnhanes/default.aspx?Cycle=2017-2020
+
+demo<-foreign::read.xport("C://r/project/P_DEMO.XPT")#demographics
+glu<-foreign::read.xport("C://r/project/P_GLU.XPT")#glucose
+glu<-glu%>%mutate(WTSAFPRP=NULL,LBDGLUSI=NULL)
+paq<-foreign::read.xport("C://r/project/P_PAQ.XPT")#phys activity
+bmx<-foreign::read.xport("C://r/project/P_BMX.XPT")#body_measurements
+
+df_raw<-inner_join(demo,glu,by="SEQN")
+df_raw<-inner_join(df_raw,paq,by="SEQN")
+df_raw<-inner_join(df_raw,bmx,by="SEQN")
+df_raw=df_raw%>%dplyr::select(-"SEQN")
+```
+
+###raw potential predictor list
+```{r}
+kable(t(colSums(is.na(df_raw))[1:8])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[9:16])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[17:24])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[25:32])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[33:40])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[41:48])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[49:56])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[56:63])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+
+kable(t(colSums(is.na(df_raw))[64:67])) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+```
+
+##remove cols with more that 10% missing
+```{r}
+n_raw=dim(df_raw)[1]
+df_new <- df_raw %>%dplyr:: select(where(~sum(is.na(.)) < n_raw*.1))
+dim(df_new)[1]
+```
+
+## conform cols with more that 10% missing were removed
+```{r}
+colSums(is.na(df_new))
+```
+
+### Select good predictors and rename
+```{r}
+df=df_new%>%dplyr::select(c("LBXGLU","BMXBMI","PAQ620","PAD680","RIDAGEYR","RIAGENDR","RIDRETH3","PAQ605","BMXWAIST"))
+df=na.omit(df)
+#PAQ620 - Moderate work activity**
+#PAQ655 - Days vigorous recreational activities**
+#PAD660 - Minutes vigorous recreational activities
+#PAQ650 - Vigorous recreational activities
+#PAQ610 - Number of days vigorous work --> add reduces n drastically
+#PAQ635 - Walk or bicycle
+#PAD680 - Minutes sedentary activity***
+#RIDRETH3 - Race/Hispanic origin w/ NH Asian
+df=df%>%dplyr::rename(bmi=BMXBMI,work_act_mod=PAQ620,min_sedentary=PAD680,age=RIDAGEYR,gender=RIAGENDR,race=RIDRETH3,work_act_vig=PAQ605,waist_circ=BMXWAIST)
+df$abnormal_fbs=as.factor(ifelse ((df$LBXGLU>126),1,0))#create factor for fasting gluecose level
+df=df%>%dplyr::relocate(abnormal_fbs, .before = bmi)
+df=df%>%dplyr::select(-"LBXGLU")
+dim(df)[1]
+```
+
+### Sample data table
+```{r}
+kable(df[sample(nrow(df), 7), ]) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+```
+
+### finals vars... Cont or descrete?
+```{r}
+### count distinct values to understand whether a field is continuous or distinct
+sapply(df,function(x) n_distinct(x))
+```
+
+### Check for multicolinearity
+```{r corrmat}
+svg("code_images/02_corr_mat.svg",width = 6, height = 6)###
+cmat<-round(cor(df[,2:dim(df)[2]]),2)#create correlation matrix
+#let viz the corrplot: https://cran.r-project.org/web/packages/corrplot/vignettes/corrplot-intro.html
+corrplot(cmat,number.cex = 1,number.digits = 2, method = 'number',col=colorRampPalette(c("blue","grey","orange"))(200))
+dev.off()
+```
+
+## remove waist circ
+```{r}
+df=df%>%dplyr::select(-"waist_circ")
+```
+
+### SDD test for seperation
+### Normality Checks
+```{r check for normality}
+#Source: https://www.projectpro.io/recipes/what-is-shapiro-test-perform-it-r
+shap_results<-NULL
+for( i in 2:dim(df)[2]){
+  shap_results<-cbind(shap_results,shapiro.test(df[,i])[2])
+  #shap_results<-cbind(shap_results,shapiro.test(sample(df[,i],5000))[2])##for big data!
+  #HO: the population is normally distributed. 
+  #HA: there is evidence that the data tested is not normally distributed
+}
+colnames(shap_results)<-colnames(df)[2:dim(df)[2]]
+shap_results<-rbind(round(as.numeric(shap_results),3))
+colnames(shap_results)<- colnames(df)[2:dim(df)[2]]
+rownames(shap_results)<-"Shapiro Test p-values"
+kable(shap_results,format.args = list(nsmall = 3)) %>% kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2') 
+```
+### Check for statistically significant difference in the means using non parametric method
+
+```{r check for statistically sig difference}
+#http://www.sthda.com/english/wiki/kruskal-wallis-test-in-r
+kw_results<-NULL
+for( i in 2:dim(df)[2]){
+  kw_results<-cbind(kw_results,kruskal.test(df[,i]~abnormal_fbs,data=df)[3])
+}
+colnames(kw_results)<-colnames(df)[2:dim(df)[2]]
+kw_results<-rbind(round(as.numeric(kw_results),3))
+colnames(kw_results)<- colnames(df)[2:dim(df)[2]]
+rownames(kw_results)<-"Kruskal Wallis Test p-values"
+kable(kw_results,format.args = list(nsmall = 3)) %>% kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+```
+
+### EDA check for imbalance
+```{r}
+table(df$abnormal_fbs)
+
+table(df$abnormal_fbs)[1]/dim(df)[1]
+```
+
+### Split in to train and test (holdover)
+```{r}
+set.seed(1122)
+n<-dim(df)[1] #number of observations in the training data
+n1<-ceiling(n*.75)#### was .75
+tag=sort(sample(1:n,n1))
+train<-df[tag,]
+test<-df[-tag,]
+```
+
+### boxplots of raw DF
+```{r}
+svg("code_images/01a_boxplots_raw.svg",width = 10, height = 20)###
+par(mar=c(3,2,3,1))#set margins
+par(mfrow = c(7,3))
+for(i in 2:dim(df)[2]){
+  boxplot(df[,i]~abnormal_fbs,data=df, main = colnames(df)[i])
+}
+dev.off() 
+```
+
+### boxplots with outliers removed for clarity
+```{r}
+svg("code_images/01b_boxplots_cleaned.svg",width = 10, height = 20)###
+par(mar=c(3,2,3,1))#set margins
+par(mfrow = c(7,3))
+my_sigma=3
+#source: https://stackoverflow.com/questions/74249686/how-to-remove-outliers-by-columns-in-r
+df_box=df%>%mutate(across(where(is.numeric),~ ifelse(abs(as.numeric(scale(.x))) > my_sigma,NA,.x)))
+for(i in 2:dim(df_box)[2]){
+  boxplot(df_box[,i]~abnormal_fbs,data=df_box, main = colnames(df_box)[i])
+}
+dev.off() 
+```
+
+
+## check imbalance
+```{r}
+table(train$abnormal_fbs)
+```
+
+### oversample 
+```{r}
+train= ROSE::ovun.sample(abnormal_fbs ~ . , data = train, method = "over",seed=1122,p=0.5)$data
+table(train$abnormal_fbs)
+```
+
+
+### GRID SEARCH and CV
+```{r,include=FALSE}
+control <- trainControl(method="LGOCV",number=10)#number is loops.   LGOCV is Monte Carlo, repeatedcv is k-fold
+##GBM
+gbm_tunegrid <- expand.grid(n.trees=c(500,1000),interaction.depth=c(4,5,6,7,8),shrinkage=c(0.01,0.25,0.5,0.75,1),n.minobsinnode = 10)
+#gbm_tunegrid <- expand.grid(n.trees=c(500),interaction.depth=c(2,3),shrinkage=1,n.minobsinnode = 10)
+my_gbm<- train(as.factor(abnormal_fbs)~., data=train, method="gbm", tuneGrid=gbm_tunegrid, trControl=control)
+##KNN
+knn_tunegrid <- expand.grid(k=c(3,5,7,9,11))
+my_knn<- train(as.factor(abnormal_fbs)~., data=train, method="knn", tuneGrid=knn_tunegrid, trControl=control)
+##LDA
+my_lda<- train(as.factor(abnormal_fbs)~., data=train, method="lda", trControl=control)
+
+my_log_reg <- train(as.factor(abnormal_fbs)~., data=train, method="glmStepAIC", trControl=control)
+```
+
+## Calc and plot ACCURACY and KAPPA
+
+```{r}
+results <- resamples(list(GBM=my_gbm, KNN=my_knn,LDA=my_lda,Log_Reg=my_log_reg))
+
+df_kappa<-as.data.frame(results$values)%>%dplyr::select(-contains("Accuracy"))
+df_kappa=df_kappa%>%pivot_longer(!Resample, values_to="Metric")%>%separate(name,c("Model","junk"),sep="~")%>%dplyr::select(-junk)
+
+df_accuracy<-as.data.frame(results$values)%>%dplyr::select(-contains("Kappa"))
+df_accuracy=df_accuracy%>%pivot_longer(!Resample, values_to="Metric")%>%separate(name,c("Model","junk"),sep="~")%>%dplyr::select(-junk)
+
+svg("code_images/03_model_accuracy.svg",width = 6, height = 4.5)
+ggplot(df_accuracy, aes(x = Model, y = Metric)) +
+  geom_boxplot() +  # Set labels for x-axis
+  labs(x = "Model", y = "Accuracy") + ggtitle("Model Accuracy Based On Cross Validation of Train Data")
+dev.off()
+```
+
+##3 Grid Search Results
+```{r}
+svg("code_images/05_boosted_grid_search.svg",width = 12, height = 5)###
+plot(my_gbm)
+dev.off() 
+##
+svg("code_images/06_knn_grid_search.svg",width = 12, height = 5)###
+plot(my_knn)
+dev.off() 
+```
+```{r}
+summary(my_log_reg)
+```
+```{r}
+logreg_coeff=my_log_reg$finalModel$coefficients
+logreg_coeff=exp(logreg_coeff)
+```
+
+
+
+
+## CM for train data.
+```{r}
+svg("code_images/07_con_mat_gbm.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_gbm,norm="overall")$table
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%2.1f%%",n)), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Train: Confusion Matrix - GBM")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+```
+```{r}
+
+svg("code_images/08_con_mat_knn.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_knn,norm="overall")$table
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%2.1f%%",n)), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Train: Confusion Matrix - KNN")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+svg("code_images/09_con_mat_lda.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_lda,norm="overall")$table
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%2.1f%%",n)), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Train: Confusion Matrix - LDA")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+svg("code_images/10_con_mat_log_reg.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_log_reg,norm="overall")$table
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%2.1f%%",n)), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Train: Confusion Matrix - Log_Reg")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+```
+```{r FUNC_T_and_Wilcox}
+TW_all_func<-function(idx,metric_ctab){
+  ###idx is model index, the one we think is best
+  ###TEALL is the df with the metric data
+
+modnames<-colnames(metric_ctab)
+
+Tout<-NULL
+Wout<-NULL
+for (b in 1:length(modnames)){ 
+  print(b)
+  if (b!=idx){
+    TEE=t.test(metric_ctab[,idx],metric_ctab[,b],paired=T)
+    Tout<-cbind(Tout,TEE$p.value)
+    DUB=wilcox.test(metric_ctab[,idx],metric_ctab[,b],paired=T)
+    Wout<-cbind(Wout,DUB$p.value)
+    #print(b)
+  }
+#Tout=round(Tout,6)
+#Wout=round(Wout,6)
+}
+TandW_full<-rbind(Tout,Wout)
+colnames(TandW_full)<-modnames[-idx]
+rownames(TandW_full)<-c("T-Test","Wilcox Test")
+##Trim output when only comparing a subset (only KNN for example)
+print(paste("comparing:",modnames[idx]))
+return(TandW_full)
+#For both tests...
+#HO: the true difference between these group means is zero. 
+#HA: the true difference is different from zero
+# If p < alpha (0.05) reject HO and accept HA
+}
+```
+
+
+```{r}
+##pivot of 
+df_accuracy_ctab<-as.data.frame(pivot_wider(df_accuracy,names_from = Model,values_from = Metric)%>%dplyr::select(-1))
+head(df_accuracy_ctab)
+
+df_kappa_ctab<-as.data.frame(pivot_wider(df_kappa,names_from = Model,values_from = Metric)%>%dplyr::select(-1))
+head(df_kappa_ctab)
+```
+
+```{r}
+baseline_mod=1
+kable(TW_all_func(baseline_mod,df_kappa_ctab)) %>%
+kable_styling("striped", full_width = FALSE, htmltable_class = 'lightable-classic-2')
+```
+
+### Prediction on Train (holdover) data
+```{r}
+## gbm
+df_test_accuracy =NULL
+my_pred_gbm <- predict(my_gbm,newdata = test[,-1])
+accuracy_gbm <- 1-mean(my_pred_gbm != test$abnormal_fbs)
+df_test_accuracy <- cbind(df_test_accuracy,accuracy_gbm)
+
+##knn
+my_pred_knn <- predict(my_knn,newdata = test[,-1])
+accuracy_knn <- 1-mean(my_pred_knn != test$abnormal_fbs)
+df_test_accuracy <- cbind(df_test_accuracy,accuracy_knn)
+
+##lda
+my_pred_lda <- predict(my_lda,newdata = test[,-1])
+accuracy_lda <- 1-mean(my_pred_lda != test$abnormal_fbs)
+df_test_accuracy <- cbind(df_test_accuracy,accuracy_lda)
+
+##log_reg
+my_pred_log_reg <- predict(my_log_reg,newdata = test[,-1])
+accuracy_log_reg <- 1-mean(my_pred_log_reg != test$abnormal_fbs)
+df_test_accuracy <- cbind(df_test_accuracy,accuracy_log_reg)
+```
+
+
+
+```{r}
+gbm_inf=summary(my_gbm)
+```
+
+###plot relative influence nicely
+```{r}
+svg("code_images/13_relative_inf_gbm_chart.svg",width =7 , height = 2)###
+ggplot(data=gbm_inf, aes(x = rel.inf, y = fct_reorder(var,rel.inf))) + geom_bar(stat = "identity") + 
+  labs(x = "Relative Influence (%)", y = "Variables") + geom_text(aes(label = round(rel.inf,1)), vjust = 0.5, hjust = -.2)+xlim(0,43)+ggtitle("GBM : Relative Influence of Variables")
+dev.off()
+```
+
+```{r}
+plot_error<-function(error_data,plotfilename="code_images/cv_error.svg",title="Sample Mean of Train Accuracy (%) from Monte Carlo CV",y_axis_title="Sample Mean of Testing Error"){
+sample_mean<-apply(error_data,2,mean)
+sample_variance<-apply(error_data,2,var)
+##put results into tall format
+model<-names(sample_variance);
+cv_results<-data.frame(model,sample_variance,sample_mean);
+ggplot(cv_results,aes(x=model,y=sample_mean*100))+ 
+  geom_bar(stat = "identity",position=position_dodge())+theme(legend.position="bottom") +
+  xlab("Model") + ylab(y_axis_title)+ ggtitle(title) +geom_text(aes(label= sprintf("%0.2f", sample_mean*100)), vjust = -0.2)+ylim(0,100)
+}
+```
+
+##Plot error from Train
+```{r}
+svg("code_images/11_cv_error.svg",width = 7, height = 2)###
+plot_error(df_accuracy_ctab,title ="Sample Mean of Accuracy - Train Data CV",y_axis_title="Accuracy (%)")
+dev.off()
+```
+### Plot kappa from train
+```{r}
+plot_kappa<-function(error_data,plotfilename="code_images/cv_error.svg",title="Kappa Score - Train Data CV",y_axis_title="Sample Mean of Kappa"){
+sample_mean<-apply(error_data,2,mean)
+sample_variance<-apply(error_data,2,var)
+##put results into tall format
+model<-names(sample_variance);
+cv_results<-data.frame(model,sample_variance,sample_mean);
+ggplot(cv_results,aes(x=model,y=sample_mean))+ 
+  geom_bar(stat = "identity",position=position_dodge())+theme(legend.position="bottom") +
+  xlab("Model") + ylab(y_axis_title)+ ggtitle(title) +geom_text(aes(label= sprintf("%0.2f", sample_mean)), vjust = -0.2)+ylim(0,1)
+}
+```
+
+
+### PLot Test (holdover) error
+```{r}
+df_test_acc2=as.data.frame(df_test_accuracy)%>%dplyr::rename(GBM=accuracy_gbm,KNN=accuracy_knn,LDA=accuracy_lda,Log_Reg=accuracy_log_reg)
+##Plot error from Train
+
+svg("code_images/12_test_accuracy.svg",width = 7, height = 1.75)###
+plot_error(df_test_acc2,title ="Model Accuracy - Holdover Test Data",y_axis_title="Accuracy (%)")
+dev.off()
+```
+
+```{r}
+svg("code_images/13_con_mat_my_gbm.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_pred_gbm,test$abnormal_fbs)$table##MODEL HERE
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%1.1f%%",100*(n/dim(test)[1]))), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Test: Confusion Matrix - GBM")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+svg("code_images/14_con_mat_my_knn.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_pred_knn,test$abnormal_fbs)$table##MODEL HERE
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%1.1f%%",100*(n/dim(test)[1]))), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Test: Confusion Matrix - KNN")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+svg("code_images/15_con_mat_my_lda.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_pred_lda,test$abnormal_fbs)$table##MODEL HERE
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%1.1f%%",100*(n/dim(test)[1]))), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Test: Confusion Matrix - LDA")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+
+svg("code_images/16_con_mat_my_log_reg.svg",width = 5, height = 5)###
+caret_cm=caret::confusionMatrix(my_pred_log_reg,test$abnormal_fbs)$table##MODEL HERE
+ggplot(data =  as_tibble(caret_cm), mapping = aes(y = Prediction, x = Reference)) +
+  geom_tile(aes(fill = n), colour = "white") +
+  geom_text(aes(label = sprintf("%1.1f%%",100*(n/dim(test)[1]))), vjust = 1,size=8) +
+  scale_fill_gradient(high =  "orange", low = "steelblue")+
+    scale_y_discrete(limits=rev)+ggtitle(label="Test: Confusion Matrix - Log_Reg")+theme(axis.text = element_text(size = 18),axis.title = element_text(size = 18))+ annotate(geom="text", x=1, y=1.35, label="False Positive",color="black",size=5)+ annotate(geom="text", x=1, y=2.35, label="True Negative",color="black",size=5)+ annotate(geom="text", x=2, y=2.35, label="False Negative",color="black",size=5)+ annotate(geom="text", x=2, y=1.35, label="True Positive",color="black",size=5)
+dev.off()
+
+
+```
+
